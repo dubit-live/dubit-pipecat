@@ -16,6 +16,7 @@ Provides two TTS services against xAI's voice API:
 See https://docs.x.ai/developers/rest-api-reference/inference/voice.
 """
 
+import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator
@@ -400,6 +401,17 @@ class XAITTSService(WebsocketTTSService):
         self._base_url = base_url
         self._codec = codec
         self._receive_task = None
+        # Dubit Edit: xAI omits context IDs, so serialize provider utterances
+        # independently of Pipecat's concurrently queued playback contexts.
+        self._send_task = None
+        self._send_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
+        self._provider_context_id: str | None = None
+        self._provider_done = asyncio.Event()
+        self._provider_done.set()
+        self._provider_activity = asyncio.Condition()
+        self._provider_activity_count = 0
+        self._clear_pending = False
+        self._replacing_websocket = False
 
         self._timestamp_context_id: str | None = None
         self._partial_word: str = ""
@@ -435,8 +447,17 @@ class XAITTSService(WebsocketTTSService):
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
+        if self._websocket and not self._send_task:
+            self._send_task = self.create_task(self._send_task_handler())
+
     async def _disconnect(self):
         await super()._disconnect()
+
+        await self._abort_pending_utterances()
+
+        if self._send_task:
+            await self.cancel_task(self._send_task)
+            self._send_task = None
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
@@ -515,17 +536,170 @@ class XAITTSService(WebsocketTTSService):
 
     async def flush_audio(self, context_id: str | None = None):
         """Signal end-of-utterance so xAI begins synthesizing what it has buffered."""
-        if not self._websocket or self._websocket.state is State.CLOSED:
+        context_id = context_id or self._provider_context_id or self.get_active_audio_context_id()
+        if (
+            not context_id
+            or not self._websocket
+            or self._websocket.state is State.CLOSED
+            or not self._send_task
+        ):
             return
-        await self._get_websocket().send(json.dumps({"type": "text.done"}))
+        await self._send_queue.put(("text.done", "", context_id))
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Cancel the current xAI utterance on barge-in without reconnecting."""
         await self.stop_all_metrics()
-        if self._websocket and self._websocket.state is State.OPEN:
-            await self._get_websocket().send(json.dumps({"type": "text.clear"}))
+        if not self._clear_pending:
+            self._clear_pending = True
+            self._provider_done.clear()
+            if self._send_task:
+                await self.cancel_task(self._send_task)
+                self._send_task = None
+            await self._discard_queued_utterances()
+
+            websocket_open = bool(self._websocket and self._websocket.state is State.OPEN)
+            try:
+                if websocket_open:
+                    await self._get_websocket().send(json.dumps({"type": "text.clear"}))
+                else:
+                    await self._finish_provider_utterance()
+            except Exception as e:
+                await self.push_error(
+                    error_msg=f"Error clearing xAI TTS utterance: {e}", exception=e
+                )
+                await self._finish_provider_utterance()
+
+            if websocket_open:
+                self._send_task = self.create_task(self._send_task_handler())
+        else:
+            await self._discard_queued_utterances()
         self._reset_timestamp_state()
         await super().on_audio_context_interrupted(context_id)
+
+    async def _discard_queued_utterances(self) -> set[str]:
+        """Drop commands that have not reached xAI and return their context IDs."""
+        context_ids: set[str] = set()
+        while True:
+            try:
+                _, _, context_id = self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            context_ids.add(context_id)
+            self._send_queue.task_done()
+        return context_ids
+
+    async def _mark_provider_activity(self):
+        """Wake the inactivity timer after genuine provider progress."""
+        async with self._provider_activity:
+            self._provider_activity_count += 1
+            self._provider_activity.notify_all()
+
+    async def _finish_provider_utterance(self):
+        """Release the sender after the current provider utterance terminates."""
+        self._provider_context_id = None
+        self._clear_pending = False
+        self._provider_done.set()
+        async with self._provider_activity:
+            self._provider_activity.notify_all()
+
+    async def _wait_for_activity_after(self, count: int):
+        async with self._provider_activity:
+            await self._provider_activity.wait_for(
+                lambda: self._provider_done.is_set() or self._provider_activity_count != count
+            )
+
+    async def _wait_for_provider_completion(self):
+        """Wait for a terminal event, extending only on synthesis progress."""
+        waiting_for_clear = self._clear_pending
+        while not self._provider_done.is_set():
+            activity_count = self._provider_activity_count
+            try:
+                if waiting_for_clear:
+                    await asyncio.wait_for(
+                        self._provider_done.wait(), timeout=self._stop_frame_timeout_s
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self._wait_for_activity_after(activity_count),
+                        timeout=self._stop_frame_timeout_s,
+                    )
+            except TimeoutError:
+                expected_event = "audio.clear" if waiting_for_clear else "audio.done"
+                await self._recover_from_provider_timeout(expected_event)
+                return
+
+    async def _recover_from_provider_timeout(self, expected_event: str):
+        """Drop the stalled utterance and replace its context-free socket."""
+        context_id = self._provider_context_id
+        await self.push_error(error_msg=f"xAI TTS timed out waiting for {expected_event}")
+        self._reset_timestamp_state()
+        if context_id and self.audio_context_available(context_id):
+            await self._close_audio_context(context_id)
+
+        self._provider_context_id = None
+        self._clear_pending = False
+        self._provider_done.clear()
+        self._replacing_websocket = True
+        try:
+            if self._receive_task:
+                await self.cancel_task(self._receive_task)
+                self._receive_task = None
+        finally:
+            self._replacing_websocket = False
+        await self._disconnect_websocket()
+        await self._connect_websocket()
+        if self._websocket:
+            self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+            await self._finish_provider_utterance()
+        else:
+            await self._abort_pending_utterances()
+
+    async def _abort_pending_utterances(self):
+        """Release provider state and close every affected local context."""
+        context_ids = await self._discard_queued_utterances()
+        if self._provider_context_id:
+            context_ids.add(self._provider_context_id)
+        await self._finish_provider_utterance()
+
+        for context_id in context_ids:
+            if self.audio_context_available(context_id):
+                await self._close_audio_context(context_id)
+
+    async def _send_task_handler(self):
+        """Send one xAI utterance at a time without blocking frame processing."""
+        while True:
+            if self._clear_pending:
+                await self._wait_for_provider_completion()
+            message_type, delta, context_id = await self._send_queue.get()
+            try:
+                if self._provider_context_id != context_id:
+                    await self._wait_for_provider_completion()
+
+                if self._provider_context_id is None:
+                    self._provider_context_id = context_id
+                    self._provider_done.clear()
+                elif self._provider_context_id != context_id:
+                    raise RuntimeError(
+                        f"xAI TTS context changed before audio.done: "
+                        f"{self._provider_context_id} -> {context_id}"
+                    )
+
+                message = {"type": message_type}
+                if message_type == "text.delta":
+                    message["delta"] = delta
+                await self._get_websocket().send(json.dumps(message))
+
+                # xAI events do not carry a context ID. Keep the next utterance
+                # queued until this one terminates so receive-side ownership is exact.
+                if message_type == "text.done":
+                    await self._wait_for_provider_completion()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await self.push_error(error_msg=f"Error sending xAI TTS text: {e}", exception=e)
+                await self._abort_pending_utterances()
+            finally:
+                self._send_queue.task_done()
 
     async def _close_audio_context(self, context_id: str):
         """Mark a context finished: emit its stop frame and drop it."""
@@ -558,6 +732,13 @@ class XAITTSService(WebsocketTTSService):
             await self.add_word_timestamps(word_times, context_id)
 
     async def _receive_messages(self):
+        try:
+            await self._receive_xai_messages()
+        finally:
+            if not self._replacing_websocket:
+                await self._abort_pending_utterances()
+
+    async def _receive_xai_messages(self):
         async for message in self._get_websocket():
             if isinstance(message, bytes):
                 logger.warning(f"{self}: unexpected binary frame from xAI TTS")
@@ -569,10 +750,14 @@ class XAITTSService(WebsocketTTSService):
                 continue
 
             msg_type = msg.get("type")
-            context_id = self.get_active_audio_context_id()
+            context_id = self._provider_context_id
 
             if msg_type == "audio.delta":
+                if self._clear_pending:
+                    continue
                 audio_b64 = msg.get("delta")
+                if audio_b64 or msg.get("audio_timestamps"):
+                    await self._mark_provider_activity()
                 if audio_b64:
                     await self.stop_ttfb_metrics()
                 if context_id:
@@ -588,7 +773,9 @@ class XAITTSService(WebsocketTTSService):
                     await self._handle_word_timestamps(msg, context_id)
             elif msg_type == "audio.done":
                 await self.stop_all_metrics()
-                if context_id:
+                if self._clear_pending:
+                    self._reset_timestamp_state()
+                elif context_id:
                     # Flush a trailing word that had no terminating space.
                     if self._timestamp_context_id == context_id and self._partial_word:
                         await self.add_word_timestamps(
@@ -596,15 +783,17 @@ class XAITTSService(WebsocketTTSService):
                         )
                     self._reset_timestamp_state()
                     await self._close_audio_context(context_id)
+                    await self._finish_provider_utterance()
             elif msg_type == "error":
                 await self.stop_all_metrics()
                 self._reset_timestamp_state()
                 error_detail = msg.get("message") or msg.get("error") or str(msg)
-                if context_id:
-                    await self._close_audio_context(context_id)
+                await self._abort_pending_utterances()
                 await self.push_error(error_msg=f"xAI TTS error: {error_detail}")
             elif msg_type == "audio.clear":
                 logger.trace(f"{self}: xAI acknowledged audio clear")
+                if self._clear_pending:
+                    await self._finish_provider_utterance()
             else:
                 logger.debug(f"{self}: unhandled xAI message type: {msg_type}")
 
@@ -615,15 +804,13 @@ class XAITTSService(WebsocketTTSService):
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
 
-            try:
-                await self._get_websocket().send(json.dumps({"type": "text.delta", "delta": text}))
-                await self.start_tts_usage_metrics(text)
-            except Exception as e:
-                yield ErrorFrame(error=f"Unknown error occurred: {e}")
+            if not self._websocket or self._websocket.state is State.CLOSED or not self._send_task:
+                yield ErrorFrame(error="xAI TTS websocket is not connected")
                 yield TTSStoppedFrame(context_id=context_id)
-                await self._disconnect()
-                await self._connect()
                 return
+
+            await self._send_queue.put(("text.delta", text, context_id))
+            await self.start_tts_usage_metrics(text)
             yield None
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")

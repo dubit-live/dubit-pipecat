@@ -159,6 +159,7 @@ class MetaSTTService(WebsocketSTTService):
         sample_rate: int | None = None,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = META_TTFS_P99,
+        vad_enabled: bool = False,
         **kwargs,
     ):
         """Initialize the Meta STT service.
@@ -174,6 +175,8 @@ class MetaSTTService(WebsocketSTTService):
             ttfs_p99_latency: P99 latency from speech end to final transcript in
                 seconds. Override for your deployment. See
                 https://github.com/pipecat-ai/stt-benchmark
+            vad_enabled: Dubit statement mode. Wrap final transcripts with standard
+                speaking markers. Leave disabled when pipeline VAD owns turns.
             **kwargs: Additional arguments passed to WebsocketSTTService.
         """
         default_settings = self.Settings(
@@ -197,6 +200,7 @@ class MetaSTTService(WebsocketSTTService):
 
         self._api_key = api_key
         self._url = url
+        self.vad_enabled = vad_enabled
 
         self._receive_task: asyncio.Task | None = None
         self._session_ready = asyncio.Event()
@@ -470,7 +474,8 @@ class MetaSTTService(WebsocketSTTService):
         # to the STT span the frame closes.
         await self.emit_stt_usage_metrics()
         language = self._language_for_frame()
-        await self.push_frame(
+        # Dubit Edit: each final can close a statement turn without waiting for more speech.
+        await self._push_transcription_with_turn_frames(
             TranscriptionFrame(
                 text,
                 self._user_id,
@@ -478,7 +483,8 @@ class MetaSTTService(WebsocketSTTService):
                 language,
                 result=message,
                 finalized=True,
-            )
+            ),
+            wrap_with_turn_frames=self.vad_enabled,
         )
         await self._trace_transcription(text, True, language)
 
