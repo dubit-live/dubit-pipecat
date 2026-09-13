@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+from websockets.asyncio.client import ClientConnection
 from websockets.protocol import State
 
 from pipecat.audio.utils import create_stream_resampler
@@ -50,6 +51,8 @@ HANDSHAKE_TIMEOUT = 10.0
 # other rate the API accepts.
 META_NATIVE_SAMPLE_RATE = 24000
 META_FALLBACK_SAMPLE_RATE = 16000
+# Meta requires continuous PCM, including during transport startup and silence.
+META_AUDIO_CHUNK_DURATION = 0.02
 
 
 _LANGUAGE_MAP = {
@@ -203,6 +206,9 @@ class MetaSTTService(WebsocketSTTService):
         self.vad_enabled = vad_enabled
 
         self._receive_task: asyncio.Task | None = None
+        self._audio_sender_task: asyncio.Task | None = None
+        self._audio_buffer = bytearray()
+        self._audio_sender_draining = False
         self._session_ready = asyncio.Event()
         self._session_id: str | None = None
         self._turn_id: int | None = None
@@ -250,16 +256,23 @@ class MetaSTTService(WebsocketSTTService):
 
     async def stop(self, frame: EndFrame):
         """Stop the speech-to-text service."""
+        # Dubit Edit: prevent the receive loop from reconnecting while audio drains.
+        await super()._disconnect()
+        await self._stop_audio_sender(drain=True, discard=False)
         await super().stop(frame)
-        await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
         """Cancel the speech-to-text service."""
+        await self._stop_audio_sender(drain=False, discard=True)
         await super().cancel(frame)
-        await self._disconnect()
+
+    async def cleanup(self):
+        """Release the sender and websocket resources."""
+        await self._stop_audio_sender(drain=False, discard=True)
+        await super().cleanup()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
-        """Forward raw audio bytes to the Meta STT WebSocket.
+        """Queue raw audio bytes for the paced Meta STT WebSocket sender.
 
         Transcription frames are pushed from the receive task, not yielded from
         this coroutine.
@@ -267,16 +280,8 @@ class MetaSTTService(WebsocketSTTService):
         if self.sample_rate != self._send_sample_rate:
             audio = await self._resampler.resample(audio, self.sample_rate, self._send_sample_rate)
 
-        if (
-            audio
-            and self._websocket
-            and self._websocket.state is State.OPEN
-            and self._session_ready.is_set()
-        ):
-            try:
-                await self._websocket.send(audio)
-            except Exception as e:
-                await self.push_error(error_msg=f"Meta STT send failed: {e}", exception=e)
+        if audio and not self._disconnecting:
+            self._audio_buffer.extend(audio)
         yield None
 
     def _build_handshake(self) -> dict[str, Any]:
@@ -321,6 +326,7 @@ class MetaSTTService(WebsocketSTTService):
     async def _disconnect(self):
         """Tear down the WebSocket connection and cancel the receive task."""
         await super()._disconnect()
+        await self._stop_audio_sender(drain=False, discard=False)
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 # Half-closes the input so the server flushes what it still owes
@@ -342,6 +348,7 @@ class MetaSTTService(WebsocketSTTService):
                 return
 
             logger.debug("Connecting to Meta STT WebSocket")
+            await self._stop_audio_sender(drain=False, discard=False)
             self._session_ready.clear()
             self._session_id = None
 
@@ -375,8 +382,14 @@ class MetaSTTService(WebsocketSTTService):
                 )
                 return
 
+            if self._disconnecting:
+                await websocket.close()
+                self._websocket = None
+                return
+
             self._session_id = ack["sessionId"]
             self._session_ready.set()
+            self._start_audio_sender(websocket, self._send_sample_rate)
             await self._call_event_handler("on_connected")
             logger.debug(f"{self} connected to Meta STT WebSocket (session {self._session_id})")
         except Exception as e:
@@ -386,6 +399,7 @@ class MetaSTTService(WebsocketSTTService):
 
     async def _disconnect_websocket(self):
         """Close the WebSocket connection."""
+        await self._stop_audio_sender(drain=False, discard=False)
         try:
             if self._websocket:
                 logger.debug("Disconnecting from Meta STT WebSocket")
@@ -398,6 +412,76 @@ class MetaSTTService(WebsocketSTTService):
             self._session_id = None
             self._turn_id = None
             await self._call_event_handler("on_disconnected")
+
+    def _start_audio_sender(self, websocket: ClientConnection, sample_rate: int):
+        """Start one paced sender for the acknowledged websocket session."""
+        self._audio_sender_draining = False
+        self._audio_sender_task = self.create_task(
+            self._audio_sender_task_handler(websocket, sample_rate),
+            name=f"{self}::_audio_sender_task_handler",
+        )
+
+    async def _stop_audio_sender(self, *, drain: bool, discard: bool):
+        """Stop the paced sender, optionally draining or discarding real audio."""
+        task = self._audio_sender_task
+        if task:
+            if drain:
+                self._audio_sender_draining = True
+                try:
+                    # A reconnect can cancel the sender while shutdown waits for it.
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    if self._audio_sender_task is task and not task.done():
+                        await self.cancel_task(task)
+                    raise
+            else:
+                await self.cancel_task(task)
+            if self._audio_sender_task is task:
+                self._audio_sender_task = None
+                self._audio_sender_draining = False
+        if discard:
+            self._audio_buffer.clear()
+
+    async def _audio_sender_task_handler(self, websocket: ClientConnection, sample_rate: int):
+        """Keep Meta ingress continuous with paced real audio or zero padding."""
+        packet_bytes = int(sample_rate * 2 * META_AUDIO_CHUNK_DURATION)
+        loop = asyncio.get_running_loop()
+        next_send = loop.time()
+
+        while True:
+            if self._audio_sender_draining and not self._audio_buffer:
+                return
+
+            delay = next_send - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            if self._audio_sender_draining and not self._audio_buffer:
+                return
+            if (
+                websocket is not self._websocket
+                or websocket.state is not State.OPEN
+                or not self._session_ready.is_set()
+            ):
+                return
+
+            real_bytes = min(len(self._audio_buffer), packet_bytes)
+            packet = bytes(self._audio_buffer[:real_bytes])
+            if real_bytes < packet_bytes:
+                packet += b"\x00" * (packet_bytes - real_bytes)
+
+            try:
+                await websocket.send(packet)
+            except Exception as e:
+                await self.push_error(error_msg=f"Meta STT send failed: {e}", exception=e)
+                return
+            del self._audio_buffer[:real_bytes]
+            padding_bytes = packet_bytes - real_bytes
+            if padding_bytes:
+                # Dubit Edit: padding is provider ingress and therefore billed audio.
+                self._stt_usage_pending_seconds += padding_bytes / (sample_rate * 2)
+
+            next_send += META_AUDIO_CHUNK_DURATION
 
     async def _receive_messages(self):
         """Receive and dispatch Meta STT WebSocket messages."""

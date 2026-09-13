@@ -15,6 +15,7 @@ from websockets.protocol import State
 from pipecat.frames.frames import InterimTranscriptionFrame, TranscriptionFrame
 from pipecat.services.meta.stt import MetaSTTService
 from pipecat.transcriptions.language import Language
+from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.utils.errors import ErrorCategory
 
 
@@ -60,6 +61,7 @@ def _service(sample_rate: int = 16000, **kwargs) -> MetaSTTService:
     service = MetaSTTService(api_key="test-key", **kwargs)
     # sample_rate is normally set from StartFrame, which these tests skip.
     service._sample_rate = sample_rate
+    service._task_manager = TaskManager()
     return service
 
 
@@ -85,23 +87,28 @@ async def test_handshake_carries_credential_and_session_config(monkeypatch):
     assert handshake["partialMode"] == "CUMULATIVE"
     assert handshake["emitAudioProgress"] is False
     assert handshake["languageBias"] == ["English"]
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
 async def test_handshake_language_bias_replaces_the_single_language(monkeypatch):
-    _, websocket = await _connected(
+    service, websocket = await _connected(
         monkeypatch,
         settings=MetaSTTService.Settings(language_bias=[Language.EN, Language.FR]),
     )
 
     assert _handshake(websocket)["languageBias"] == ["English", "French"]
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
 async def test_handshake_omits_language_bias_when_language_is_unset(monkeypatch):
-    _, websocket = await _connected(monkeypatch, settings=MetaSTTService.Settings(language=None))
+    service, websocket = await _connected(
+        monkeypatch, settings=MetaSTTService.Settings(language=None)
+    )
 
     assert "languageBias" not in _handshake(websocket)
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
@@ -110,33 +117,45 @@ async def test_handshake_omits_language_bias_when_language_is_unset(monkeypatch)
     [(16000, "PCM_16KHZ"), (24000, "PCM_24KHZ"), (8000, "PCM_16KHZ")],
 )
 async def test_audio_encoding_follows_the_pipeline_sample_rate(monkeypatch, sample_rate, encoding):
-    _, websocket = await _connected(monkeypatch, sample_rate)
+    service, websocket = await _connected(monkeypatch, sample_rate)
 
     assert _handshake(websocket)["audioEncoding"] == encoding
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
 async def test_off_rate_audio_is_resampled_before_it_is_sent(monkeypatch):
     service, websocket = await _connected(monkeypatch, 8000)
+    await service._stop_audio_sender(drain=False, discard=False)
+    baseline = len(websocket.sent)
 
     # The stream resampler buffers, so a single short chunk yields nothing.
     for _ in range(10):
         async for _ in service.run_stt(b"\x00" * 1600):
             pass
 
-    audio_sent = b"".join(chunk for chunk in websocket.sent if isinstance(chunk, bytes))
-    # 8 kHz in, 16 kHz out: twice the bytes, less what the resampler still holds.
-    assert 0.9 < len(audio_sent) / (2 * 10 * 1600) <= 1.0
+    service._start_audio_sender(websocket, service._send_sample_rate)
+    await service._stop_audio_sender(drain=True, discard=False)
+    audio_sent = b"".join(chunk for chunk in websocket.sent[baseline:] if isinstance(chunk, bytes))
+    # 8 kHz in, 16 kHz out: twice the bytes, plus at most one padded sender packet.
+    assert 0.9 < len(audio_sent) / (2 * 10 * 1600) <= 1.02
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
 async def test_native_rate_audio_is_sent_unchanged(monkeypatch):
     service, websocket = await _connected(monkeypatch, 24000)
+    await service._stop_audio_sender(drain=False, discard=False)
+    baseline = len(websocket.sent)
 
     async for _ in service.run_stt(b"\x01" * 480):
         pass
 
-    assert websocket.sent[-1] == b"\x01" * 480
+    service._start_audio_sender(websocket, service._send_sample_rate)
+    await service._stop_audio_sender(drain=True, discard=False)
+    audio_sent = b"".join(chunk for chunk in websocket.sent[baseline:] if isinstance(chunk, bytes))
+    assert audio_sent == b"\x01" * 480 + b"\x00" * 480
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
@@ -145,6 +164,7 @@ async def test_accepted_handshake_readies_the_session(monkeypatch):
 
     assert service._session_ready.is_set()
     assert service._session_id == "stream-123"
+    await service._disconnect()
 
 
 @pytest.mark.asyncio
