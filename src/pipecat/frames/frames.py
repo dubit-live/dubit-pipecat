@@ -2013,6 +2013,32 @@ with warnings.catch_warnings():
 
 
 @dataclass
+class STTSpeechStartFrame(ControlFrame):
+    """Dubit Edit: provider speech onset, independent of Pipecat user-turn decisions.
+
+    Parameters:
+        session_id: Provider session identifying this stream.
+        turn_id: Provider identifier for the speech turn.
+    """
+
+    session_id: str
+    turn_id: int | str
+
+
+@dataclass
+class STTSpeechEndFrame(ControlFrame):
+    """Dubit Edit: provider speech endpoint; the completed transcript may arrive later.
+
+    Parameters:
+        session_id: Provider session identifying this stream.
+        turn_id: Provider identifier for the speech turn.
+    """
+
+    session_id: str
+    turn_id: int | str
+
+
+@dataclass
 class EndFrame(ControlFrame, UninterruptibleFrame):
     """Frame indicating pipeline has ended and should shut down.
 

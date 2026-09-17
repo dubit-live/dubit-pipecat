@@ -28,6 +28,8 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InterimTranscriptionFrame,
+    STTSpeechEndFrame,
+    STTSpeechStartFrame,
     TranscriptionFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
@@ -211,8 +213,13 @@ class MetaSTTService(WebsocketSTTService):
         self._audio_sender_draining = False
         self._session_ready = asyncio.Event()
         self._session_id: str | None = None
-        self._turn_id: int | None = None
+        self._turn_id: int | str | None = None
         self._resampler = create_stream_resampler()
+
+    @property
+    def supports_turn_boundaries(self) -> bool:
+        """Dubit Edit: endpointing supplies definite speech boundaries and completed turns."""
+        return self._settings.mode == "ENDPOINTING"
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate metrics.
@@ -351,6 +358,7 @@ class MetaSTTService(WebsocketSTTService):
             await self._stop_audio_sender(drain=False, discard=False)
             self._session_ready.clear()
             self._session_id = None
+            self._turn_id = None
 
             if self.sample_rate != self._send_sample_rate:
                 logger.debug(
@@ -504,11 +512,16 @@ class MetaSTTService(WebsocketSTTService):
         if msg_type == "transcript":
             await self._handle_transcript(message)
         elif msg_type == "speechComplete":
-            self._turn_id = message.get("turnId")
             await self._push_final_transcript(message)
         elif msg_type in ("speechStart", "speechEnd"):
-            self._turn_id = message.get("turnId")
-            logger.trace(f"{self} Meta STT {msg_type} (turn {self._turn_id})")
+            turn_id = message.get("turnId")
+            # Dubit Edit: a late completion/end must not relabel the newer turn's partials.
+            if msg_type == "speechStart":
+                self._turn_id = turn_id
+            if self.supports_turn_boundaries:
+                frame_type = STTSpeechStartFrame if msg_type == "speechStart" else STTSpeechEndFrame
+                await self.push_frame(frame_type(session_id=self._session_id, turn_id=turn_id))
+            logger.trace(f"{self} Meta STT {msg_type} (turn {turn_id})")
         elif msg_type == "speaker":
             # Diarization marks a possible new speaker mid-turn rather than a
             # boundary, so the label only rides along on the transcript result.
@@ -538,36 +551,35 @@ class MetaSTTService(WebsocketSTTService):
             await self._push_final_transcript(message, text=text)
             return
 
-        await self.push_frame(
-            InterimTranscriptionFrame(
-                text,
-                self._user_id,
-                time_now_iso8601(),
-                self._language_for_frame(),
-                result=message,
-            )
+        frame = InterimTranscriptionFrame(
+            text,
+            self._user_id,
+            time_now_iso8601(),
+            self._language_for_frame(),
+            result=message,
         )
+        frame.metadata.update(stt_session_id=self._session_id, stt_turn_id=self._turn_id)
+        await self.push_frame(frame)
 
     async def _push_final_transcript(self, message: dict[str, Any], *, text: str | None = None):
         """Push the transcript that closes a turn."""
         text = text if text is not None else message.get("transcript", "")
+        language = self._language_for_frame()
+        frame = TranscriptionFrame(
+            text, self._user_id, time_now_iso8601(), language, result=message, finalized=True
+        )
+        frame.metadata.update(stt_session_id=self._session_id, stt_turn_id=message.get("turnId"))
         if not text:
+            # Dubit Edit: an empty completion still releases this provider turn's buffer.
+            await self.push_frame(frame)
             return
 
         # Report usage before the transcription frame so tracing can attach it
         # to the STT span the frame closes.
         await self.emit_stt_usage_metrics()
-        language = self._language_for_frame()
         # Dubit Edit: each final can close a statement turn without waiting for more speech.
         await self._push_transcription_with_turn_frames(
-            TranscriptionFrame(
-                text,
-                self._user_id,
-                time_now_iso8601(),
-                language,
-                result=message,
-                finalized=True,
-            ),
+            frame,
             wrap_with_turn_frames=self.vad_enabled,
         )
         await self._trace_transcription(text, True, language)

@@ -235,6 +235,11 @@ class STTService(AIService):
             self._finalize_requested = False
 
     @property
+    def supports_turn_boundaries(self) -> bool:
+        """Dubit Edit: whether this adapter exposes provider endpoints and turn-tagged text."""
+        return False
+
+    @property
     def sample_rate(self) -> int:
         """Get the current sample rate for audio processing.
 

@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock
 import pytest
 from websockets.protocol import State
 
-from pipecat.frames.frames import InterimTranscriptionFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    InterimTranscriptionFrame,
+    STTSpeechEndFrame,
+    STTSpeechStartFrame,
+    TranscriptionFrame,
+)
 from pipecat.services.meta.stt import MetaSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -61,6 +66,7 @@ def _service(sample_rate: int = 16000, **kwargs) -> MetaSTTService:
     service = MetaSTTService(api_key="test-key", **kwargs)
     # sample_rate is normally set from StartFrame, which these tests skip.
     service._sample_rate = sample_rate
+    service._session_id = "stream-123"
     service._task_manager = TaskManager()
     return service
 
@@ -210,8 +216,10 @@ async def test_endpointing_turn_emits_interims_then_the_completed_transcript(mon
     await service._receive_messages()
 
     assert [type(frame) for frame in frames] == [
+        STTSpeechStartFrame,
         InterimTranscriptionFrame,
         InterimTranscriptionFrame,
+        STTSpeechEndFrame,
         TranscriptionFrame,
     ]
     assert frames[-1].text == "What is the capital?"

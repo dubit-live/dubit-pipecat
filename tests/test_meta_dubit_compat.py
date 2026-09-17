@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock
 
 from pipecat.frames.frames import (
     InterimTranscriptionFrame,
+    STTSpeechEndFrame,
+    STTSpeechStartFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -21,6 +23,7 @@ from pipecat.services.meta.stt import MetaSTTService
 class MetaDubitCompatTests(unittest.IsolatedAsyncioTestCase):
     def service(self, **kwargs):
         service = MetaSTTService(api_key="offline-test", **kwargs)
+        service._session_id = "stream-test"
         service.push_frame = AsyncMock()
         service.emit_stt_usage_metrics = AsyncMock()
         service._trace_transcription = AsyncMock()
@@ -57,4 +60,7 @@ class MetaDubitCompatTests(unittest.IsolatedAsyncioTestCase):
         await service._handle_message({"type": "transcript", "transcript": "Hello", "final": True})
         await service._handle_message({"type": "speechEnd", "turnId": 1})
         frames = [call.args[0] for call in service.push_frame.await_args_list]
-        self.assertEqual([type(frame) for frame in frames], [InterimTranscriptionFrame])
+        self.assertEqual(
+            [type(frame) for frame in frames],
+            [STTSpeechStartFrame, InterimTranscriptionFrame, STTSpeechEndFrame],
+        )
