@@ -292,6 +292,28 @@ class RTVIProcessor(FrameProcessor):
             if transport_message.get("label") != RTVI.MESSAGE_LABEL:
                 logger.warning(f"Ignoring not RTVI message: {transport_message}")
                 return
+            # Dubit Edit: shared rooms deliver other bots' server notifications.
+            # Ignore them before request validation to prevent error-reply loops.
+            message_type = transport_message.get("type")
+            if isinstance(message_type, str) and (
+                message_type.startswith(("bot-", "user-", "vad-user-"))
+                or message_type
+                in {
+                    "error",
+                    "error-response",
+                    "server-message",
+                    "server-response",
+                    "metrics",
+                    "system-log",
+                    "llm-function-call",
+                    "llm-function-call-started",
+                    "llm-function-call-in-progress",
+                    "llm-function-call-stopped",
+                    "ui-command",
+                    "ui-job-group",
+                }
+            ):
+                return
             message = RTVI.Message.model_validate(transport_message)
             await self._message_queue.put(message)
         except ValidationError as e:

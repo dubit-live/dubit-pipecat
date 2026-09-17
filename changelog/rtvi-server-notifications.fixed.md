@@ -1,0 +1,1 @@
+- `RTVIProcessor` ignores peer-server notifications before client request validation, preventing error-reply loops between bots sharing a room. Client requests still require an ID.

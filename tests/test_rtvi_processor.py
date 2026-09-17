@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import unittest
 import warnings
 from unittest.mock import AsyncMock, Mock
@@ -15,9 +16,99 @@ from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     InputDTMFFrame,
+    InputTransportMessageFrame,
     InputTransportStartAudioStreamingFrame,
 )
 from pipecat.processors.frameworks.rtvi.processor import RTVIProcessor
+
+
+class TestRTVIIncomingMessages(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.processor = RTVIProcessor()
+        self.processor._message_queue = asyncio.Queue()
+        self.processor.push_frame = AsyncMock()
+
+    async def asyncTearDown(self):
+        await self.processor.cleanup()
+
+    async def test_peer_notifications_are_not_dispatched_as_client_requests(self):
+        for message_type in (
+            "error",
+            "error-response",
+            "server-message",
+            "server-response",
+            "metrics",
+            "system-log",
+            "bot-ready",
+            "bot-started-speaking",
+            "bot-stopped-speaking",
+            "bot-output",
+            "bot-llm-search-response",
+            "user-transcription",
+            "user-llm-text",
+            "vad-user-started-speaking",
+            "llm-function-call",
+            "llm-function-call-started",
+            "llm-function-call-in-progress",
+            "llm-function-call-stopped",
+            "ui-command",
+            "ui-job-group",
+        ):
+            for has_id in (False, True):
+                with self.subTest(type=message_type, has_id=has_id):
+                    payload = {"label": "rtvi-ai", "type": message_type, "data": {}}
+                    if has_id:
+                        payload["id"] = "another-bots-request"
+                    await self.processor._handle_transport_message(
+                        InputTransportMessageFrame(message=payload)
+                    )
+                    self.assertTrue(self.processor._message_queue.empty())
+                    self.processor.push_frame.assert_not_awaited()
+
+    async def test_client_requests_still_reach_dispatch(self):
+        for message_type in (
+            "client-ready",
+            "client-message",
+            "disconnect-bot",
+            "send-text",
+            "dtmf",
+            "raw-audio",
+            "raw-audio-batch",
+            "llm-function-call-result",
+            "ui-event",
+            "ui-snapshot",
+            "ui-cancel-job-group",
+        ):
+            with self.subTest(type=message_type):
+                await self.processor._handle_transport_message(
+                    InputTransportMessageFrame(
+                        message={"label": "rtvi-ai", "type": message_type, "id": "request-1"}
+                    )
+                )
+                request = self.processor._message_queue.get_nowait()
+                self.assertEqual((request.type, request.id), (message_type, "request-1"))
+                self.processor._message_queue.task_done()
+                self.processor.push_frame.assert_not_awaited()
+
+    async def test_missing_client_id_reports_once_without_starting_a_peer_error_loop(self):
+        await self.processor._handle_transport_message(
+            InputTransportMessageFrame(message={"label": "rtvi-ai", "type": "client-ready"})
+        )
+        self.assertTrue(self.processor._message_queue.empty())
+        self.processor.push_frame.assert_awaited_once()
+        error = self.processor.push_frame.call_args.args[0].message
+        self.assertEqual(error["type"], "error")
+        self.assertIn("Field required", error["data"]["error"])
+
+        peer = RTVIProcessor()
+        peer._message_queue = asyncio.Queue()
+        peer.push_frame = AsyncMock()
+        try:
+            await peer._handle_transport_message(InputTransportMessageFrame(message=error))
+            peer.push_frame.assert_not_awaited()
+            self.assertTrue(peer._message_queue.empty())
+        finally:
+            await peer.cleanup()
 
 
 class TestRTVIClientReadyVersionHandling(unittest.IsolatedAsyncioTestCase):
