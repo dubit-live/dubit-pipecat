@@ -6,7 +6,12 @@
 
 import unittest
 
-from pipecat.evals.judge import EvalJudge, JudgeVerdict, _parse_run_verdicts, _parse_verdict
+from pipecat.evals.judge import (
+    EvalJudge,
+    JudgeVerdict,
+    _parse_run_verdicts,
+    _parse_verdict,
+)
 
 
 class TestParseRunVerdicts(unittest.TestCase):
@@ -220,6 +225,98 @@ class TestJudgeEvaluate(unittest.IsolatedAsyncioTestCase):
         judge.add_assistant_message("anything")
         v = await judge.evaluate("anything")
         self.assertFalse(v.passed)
+
+
+class TestJudgeEvaluateRun(unittest.IsolatedAsyncioTestCase):
+    async def test_the_run_is_judged_over_the_conversation_the_judge_kept(self):
+        """Reply segments merge into one numbered bot turn; tool calls sit inline."""
+        svc = _FakeLLMService(
+            [
+                '{"goal": {"verdict": "yes", "reason": "booked"}, "turns": {"polite": ["yes", "yes"]}}'
+            ]
+        )
+        judge = EvalJudge(svc)
+        judge.add_user_message("Book a table at six.")
+        judge.add_tool_call('book({"time": "6pm"})')
+        judge.add_assistant_message("Let me check.")
+        judge.add_assistant_message("Done, six o'clock.")
+        judge.add_user_message("Thanks.")
+        judge.add_assistant_message("You're welcome.")
+
+        verdicts = await judge.evaluate_run({"polite": "is polite"}, "a table is booked")
+
+        ask = svc.calls[0]["messages"][-1]["content"]
+        self.assertIn("User: Book a table at six.", ask)
+        self.assertIn('[tool call] book({"time": "6pm"})', ask)
+        self.assertIn("Bot turn 1: Let me check. Done, six o'clock.", ask)
+        self.assertIn("Bot turn 2: You're welcome.", ask)
+        self.assertIn("there are 2 bot turns", ask)
+        self.assertTrue(verdicts.goal.passed)
+        self.assertEqual([v.verdict for v in verdicts.turns["polite"]], ["yes", "yes"])
+
+    async def test_a_reply_is_judged_on_the_spoken_conversation_only(self):
+        svc = _FakeLLMService(['{"verdict": "yes", "reason": "ok"}'])
+        judge = EvalJudge(svc)
+        judge.add_tool_call("lookup()")
+        judge.add_assistant_message("It's 72 and sunny.")
+        await judge.evaluate("describes the weather")
+        roles = [m["role"] for m in svc.calls[0]["messages"]]
+        self.assertEqual(roles, ["assistant", "user"])
+
+    async def test_a_transcript_passed_in_is_deprecated_and_judged_in_place_of_the_kept_one(self):
+        svc = _FakeLLMService(
+            ['{"goal": {"verdict": "yes", "reason": "ok"}, "turns": {"polite": ["yes"]}}'] * 2
+        )
+        judge = EvalJudge(svc)
+        judge.add_assistant_message("kept")
+        given = [{"role": "assistant", "content": "given"}]
+        for call in (
+            lambda: judge.evaluate_run(given, {"polite": "is polite"}, "done"),
+            lambda: judge.evaluate_run({"polite": "is polite"}, "done", transcript=given),
+        ):
+            with self.assertWarns(DeprecationWarning):
+                verdicts = await call()
+            self.assertTrue(verdicts.goal.passed)
+            ask = svc.calls[-1]["messages"][-1]["content"]
+            self.assertIn("Bot turn 1: given", ask)
+            self.assertNotIn("kept", ask)
+
+
+class TestJudgeToolCalls(unittest.IsolatedAsyncioTestCase):
+    """A verdict on one function call."""
+
+    async def test_evaluate_call_asks_about_the_named_call(self):
+        svc = _FakeLLMService(['{"verdict": "no", "reason": "wrong speaker"}'])
+        judge = EvalJudge(svc)
+        v = await judge.evaluate_call("submit", {"speaker": "Ann"}, "submitted for Bob")
+        self.assertFalse(v.passed)
+        self.assertEqual(v.reason, "wrong speaker")
+        ask = svc.calls[0]["messages"][-1]["content"]
+        self.assertIn('called the function `submit` with arguments `{"speaker": "Ann"}`', ask)
+        self.assertIn("Criterion: submitted for Bob", ask)
+
+    async def test_evaluate_call_instructs_a_yes_or_no_verdict(self):
+        """A call is judged under its own instructions: there is no reply to wait for."""
+        svc = _FakeLLMService(['{"verdict": "yes", "reason": "ok"}'])
+        judge = EvalJudge(svc)
+        await judge.evaluate_call("submit", {"speaker": "Ann"}, "submitted for Ann")
+        instruction = svc.calls[0]["system_instruction"]
+        self.assertIn("function call", instruction)
+        self.assertNotIn("continue", instruction)
+
+    async def test_evaluate_call_caches_per_call(self):
+        """The same criterion on two different calls is two questions."""
+        svc = _FakeLLMService(
+            ['{"verdict": "yes", "reason": "a"}', '{"verdict": "no", "reason": "b"}']
+        )
+        judge = EvalJudge(svc)
+        first = await judge.evaluate_call("submit", {"n": 1}, "n is one")
+        again = await judge.evaluate_call("submit", {"n": 1}, "n is one")
+        second = await judge.evaluate_call("submit", {"n": 2}, "n is one")
+        self.assertTrue(first.passed)
+        self.assertTrue(again.passed)
+        self.assertFalse(second.passed)
+        self.assertEqual(len(svc.calls), 2)
 
 
 class TestJudgeVerdictDataclass(unittest.TestCase):

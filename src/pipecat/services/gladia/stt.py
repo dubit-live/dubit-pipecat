@@ -708,6 +708,10 @@ class GladiaSTTService(WebsocketSTTService):
                             self._audio_buffer = self._audio_buffer[trim_size:]
                             self._bytes_sent = end_byte
 
+                elif content["type"] == "audio_chunk":
+                    error = (content.get("error") or {}).get("message", "Unknown error")
+                    await self.push_error(error_msg=f"Gladia rejected an audio chunk: {error}")
+
                 elif content["type"] == "transcript":
                     utterance = content["data"]["utterance"]
                     language = utterance["language"]
@@ -745,6 +749,10 @@ class GladiaSTTService(WebsocketSTTService):
                             )
                         )
                 elif content["type"] == "translation":
+                    if content.get("error") or content.get("data") is None:
+                        error = (content.get("error") or {}).get("message", "Unknown error")
+                        await self.push_error(error_msg=f"Gladia translation addon error: {error}")
+                        continue
                     translated_utterance = content["data"]["translated_utterance"]
                     original_language = content["data"]["original_language"]
                     translated_language = translated_utterance["language"]
