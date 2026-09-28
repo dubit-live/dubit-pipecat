@@ -481,6 +481,11 @@ class PipelineWorker(BaseWorker):
 
         self._finished = False
         self._cancelled = False
+        self._cancel_event = asyncio.Event()
+        self._pipeline_cancel_event = asyncio.Event()
+        self._cancel_frame: CancelFrame | None = None
+        self._pipeline_initialized = False
+        self._terminal_notified = False
 
         # This queue is the queue used to push frames to the pipeline.
         self._push_queue = asyncio.Queue()
@@ -847,41 +852,42 @@ class PipelineWorker(BaseWorker):
         if self.has_finished():
             return
 
+        await super().setup(self._task_manager or params.task_manager)
+        cleanup_pipeline = True
+        cancel_wait = self.create_task(self._cancel_event.wait())
         try:
-            # Setup processors.
-            if not await self._setup_within_timeout(params):
-                # Nothing was pushed into the pipeline, so there is nothing to
-                # drain: release whatever was set up and give up.
-                await self._cleanup(cleanup_pipeline=True)
-                return
-
-            # Create the worker's tasks and wait for the push task, which
-            # feeds frames to the very beginning of our pipeline (i.e. to
-            # our controlled source processor).
-            await self._create_tasks()
-
-            try:
-                # Wait for pipeline to finish.
-                await self._wait_for_pipeline_finished()
-            except asyncio.CancelledError:
-                logger.debug(f"Pipeline worker {self} got cancelled from outside...")
-                # We have been cancelled from outside, let's just cancel everything.
-                await self._cancel()
-                # Wait again for pipeline to finish. This time we have really
-                # cancelled, so it should really finish.
-                await self._wait_for_pipeline_finished()
-                # Re-raise in case there's more cleanup to do.
-                raise
+            if not self._cancelled:
+                self._process_push_task = self.create_task(self._run_pipeline(params))
+                try:
+                    await asyncio.wait(
+                        [self._process_push_task, cancel_wait],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    await self.cancel()
+                    raise
+                if not self._cancelled:
+                    cleanup_pipeline = self._process_push_task.result() is not False
         finally:
-            # We can reach this point for different reasons:
-            #
-            # 1. The pipeline worker has finished (try case).
-            # 2. By an asyncio worker cancellation (except case).
-            logger.debug(f"Pipeline worker {self} is finishing...")
-            await self._cancel_tasks()
-            self._print_dangling_tasks()
-            self._finished = True
-            logger.debug(f"Pipeline worker {self} has finished")
+            # run() alone owns finalization, including partially completed setup.
+            try:
+                await self._cancel_tasks()
+                if self._cancelled and self._pipeline_initialized:
+                    await self._wait_for_pipeline_end(self._cancel_frame)
+                await self._cleanup(cleanup_pipeline)
+            finally:
+                await self.cancel_task(cancel_wait)
+                self._finished_event.set()
+                self._finished = True
+                self._print_dangling_tasks()
+                logger.debug(f"Pipeline worker {self} has finished")
+
+    async def _run_pipeline(self, params: WorkerParams) -> bool:
+        """Set up processors and drive frames until a terminal frame drains."""
+        if not await self._setup_within_timeout(params):
+            return True
+        self._pipeline_initialized = True
+        return await self._process_push_queue()
 
     async def queue_frame(
         self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
@@ -896,7 +902,10 @@ class PipelineWorker(BaseWorker):
             direction: The direction to push the frame. Defaults to downstream.
         """
         if direction == FrameDirection.DOWNSTREAM:
-            await self._push_queue.put(frame)
+            if isinstance(frame, CancelFrame):
+                await self.cancel(reason=frame.reason)
+            elif not self._cancelled:
+                await self._push_queue.put(frame)
         else:
             await self._sink.queue_frame(frame, direction)
 
@@ -1129,14 +1138,8 @@ class PipelineWorker(BaseWorker):
         if not self._cancelled:
             logger.debug(f"Cancelling pipeline worker {self}")
             self._cancelled = True
-            if not self._pipeline_start_event.is_set():
-                self._pipeline_start_event.set()
-            await self.queue_frame(CancelFrame(reason=reason))
-
-    async def _create_tasks(self):
-        """Create and start all pipeline processing tasks."""
-        self._process_push_task = self.create_task(self._process_push_queue())
-        return self._process_push_task
+            self._cancel_frame = CancelFrame(reason=reason)
+            self._cancel_event.set()
 
     def _maybe_start_heartbeat_tasks(self):
         """Start heartbeat tasks if heartbeats are enabled and not already running."""
@@ -1210,13 +1213,23 @@ class PipelineWorker(BaseWorker):
         logger.debug(f"{self}: {frame} reached the end of the pipeline, pipeline is now ready.")
         return True
 
+    async def _notify_pipeline_finished(self, frame: Frame):
+        """Claim the terminal notification before scheduling its handlers."""
+        if not self._terminal_notified:
+            self._terminal_notified = True
+            await self._call_event_handler("on_pipeline_finished", frame)
+
     async def _wait_for_pipeline_end(self, frame: Frame):
         """Wait for the specified frame to reach the end of the pipeline."""
+
+        async def send_cancel():
+            await self._pipeline.queue_frame(frame)
+            await self._pipeline_cancel_event.wait()
 
         async def wait_for_cancel():
             try:
                 await asyncio.wait_for(
-                    self._pipeline_end_event.wait(), timeout=self._cancel_timeout_secs
+                    self.create_task(send_cancel()), timeout=self._cancel_timeout_secs
                 )
                 logger.debug(f"{self}: {frame} reached the end of the pipeline.")
             except TimeoutError:
@@ -1225,7 +1238,7 @@ class PipelineWorker(BaseWorker):
                 )
                 await self._call_event_handler("on_pipeline_timeout", frame)
             finally:
-                await self._call_event_handler("on_pipeline_finished", frame)
+                await self._notify_pipeline_finished(frame)
 
         logger.debug(f"{self}: Closing. Waiting for {frame} to reach the end of the pipeline...")
 
@@ -1238,18 +1251,14 @@ class PipelineWorker(BaseWorker):
             await self._pipeline_end_event.wait()
             logger.debug(f"{self}: {frame} reached the end of the pipeline, pipeline is closing.")
 
-        self._pipeline_end_event.clear()
+        if isinstance(frame, CancelFrame):
+            self._pipeline_cancel_event.clear()
+        else:
+            self._pipeline_end_event.clear()
 
         # We are really done. Setting ``_finished_event`` makes
         # ``BaseWorker.wait()`` resolve for callers awaiting this worker.
         self._finished_event.set()
-
-    async def _wait_for_pipeline_finished(self):
-        await self._finished_event.wait()
-        # Make sure we wait for the push task to complete.
-        if self._process_push_task:
-            await self._process_push_task
-            self._process_push_task = None
 
     async def _setup_within_timeout(self, params: WorkerParams) -> bool:
         """Set up the pipeline worker and all processors, bounded by a timeout.
@@ -1315,7 +1324,11 @@ class PipelineWorker(BaseWorker):
             # ``setup.pipeline_worker.app_resources`` instead.
             tool_resources=self._app_resources,
         )
-        await self.create_task(self._pipeline.setup(setup))
+        try:
+            await self.create_task(self._pipeline.setup(setup))
+        except BaseException:
+            await self.cancel_task(lazy_imports_task)
+            raise
 
         # Make sure lazy imports are done at this point. Whatever of the load
         # outlasts setting the processors up is startup time no processor
@@ -1370,7 +1383,7 @@ class PipelineWorker(BaseWorker):
         await self._propagate_cancel_to_children(message)
         await self.cancel(reason=message.reason)
 
-    async def _process_push_queue(self):
+    async def _process_push_queue(self) -> bool:
         """Process frames from the push queue and send them through the pipeline.
 
         This is the worker that runs the pipeline for the first time by sending
@@ -1411,7 +1424,7 @@ class PipelineWorker(BaseWorker):
             running = not isinstance(frame, (CancelFrame, EndFrame, StopFrame))
             cleanup_pipeline = not isinstance(frame, StopFrame)
             self._push_queue.task_done()
-        await self._cleanup(cleanup_pipeline)
+        return cleanup_pipeline
 
     async def _advance_flush_probe(self, frame: PipelineFlushFrame, at_sink: bool) -> None:
         """Move a flush probe along its trip, settling it once it is done.
@@ -1477,7 +1490,7 @@ class PipelineWorker(BaseWorker):
         elif isinstance(frame, CancelWorkerFrame):
             # Tell the worker we should end right away.
             logger.debug(f"{self}: received cancel worker frame upstream {frame}")
-            await self.queue_frame(CancelFrame(reason=frame.reason))
+            await self.cancel(reason=frame.reason)
         elif isinstance(frame, StopWorkerFrame):
             # Tell the worker we should stop nicely.
             logger.debug(f"{self}: received stop worker frame upstream {frame}")
@@ -1552,13 +1565,15 @@ class PipelineWorker(BaseWorker):
 
             self._pipeline_start_event.set()
         elif isinstance(frame, EndFrame):
-            await self._call_event_handler("on_pipeline_finished", frame)
+            if not self._cancelled:
+                await self._notify_pipeline_finished(frame)
             self._pipeline_end_event.set()
         elif isinstance(frame, StopFrame):
-            await self._call_event_handler("on_pipeline_finished", frame)
+            if not self._cancelled:
+                await self._notify_pipeline_finished(frame)
             self._pipeline_end_event.set()
         elif isinstance(frame, CancelFrame):
-            self._pipeline_end_event.set()
+            self._pipeline_cancel_event.set()
         elif isinstance(frame, HeartbeatFrame):
             await self._heartbeat_queue.put(frame)
         elif isinstance(frame, EndWorkerFrame):

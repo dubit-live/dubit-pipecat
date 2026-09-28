@@ -523,6 +523,7 @@ class DailyTransportClient(EventHandler):
         self._dial_in_session_id: str = ""
 
         self._joined = False
+        self._cleanup_started = False
         self._joined_event = asyncio.Event()
 
         self._task_manager: BaseTaskManager | None = None
@@ -735,6 +736,16 @@ class DailyTransportClient(EventHandler):
         Args:
             setup: The frame processor setup configuration.
         """
+        try:
+            await self._setup(setup)
+        except BaseException:
+            # A failed shared acquire rolls back its owner count, but native
+            # allocations made before the failure still need releasing.
+            await self._cleanup_resources()
+            raise
+
+    async def _setup(self, setup: FrameProcessorSetup):
+        """Allocate the shared client's resources."""
         self._task_manager = setup.task_manager
 
         self._in_sample_rate = self._params.audio_in_sample_rate or setup.audio_in_sample_rate
@@ -800,18 +811,25 @@ class DailyTransportClient(EventHandler):
     @releases("client")
     async def cleanup(self):
         """Cleanup client resources and cancel tasks."""
-        if self._event_task and self._task_manager:
-            await self._task_manager.cancel_task(self._event_task)
-            self._event_task = None
-        if self._audio_task and self._task_manager:
-            await self._task_manager.cancel_task(self._audio_task)
-            self._audio_task = None
-        if self._video_task and self._task_manager:
-            await self._task_manager.cancel_task(self._video_task)
-            self._video_task = None
-        # Make sure we don't block the event loop in case `client.release()`
-        # takes extra time.
-        await asyncio.to_thread(self._cleanup)
+        await self._cleanup_resources()
+
+    async def cleanup_uninitialized(self):
+        """Release constructor resources if no owner has started client setup."""
+        if self._task_manager is None:
+            await self._cleanup_resources()
+
+    async def _cleanup_resources(self):
+        """Claim and release native resources even after interrupted setup."""
+        if self._cleanup_started:
+            return
+        self._cleanup_started = True
+        try:
+            for task in (self._event_task, self._audio_task, self._video_task):
+                if task and self._task_manager:
+                    await self._task_manager.cancel_task(task)
+        finally:
+            # Native release can block, so keep it off the event loop.
+            await asyncio.to_thread(self._cleanup)
 
     @acquires("room")
     async def join(self):
@@ -961,11 +979,9 @@ class DailyTransportClient(EventHandler):
     def _cleanup(self):
         """Cleanup the Daily client instance."""
         if self._client:
-            self._client.release()
-            # The client is not usable after release(); the None breaks the
-            # declared CallClient type on purpose so a double cleanup is a
-            # no-op.
+            client = self._client
             self._client = None  # pyright: ignore[reportAttributeAccessIssue]
+            client.release()
 
     def participants(self) -> Mapping[str, Any]:
         """Get current participants in the room.
@@ -1817,6 +1833,8 @@ class DailyInputTransport(BaseInputTransport):
 
         self._transport = transport
         self._client = client
+        self._client_acquired = False
+        self._room_acquired = False
         self._params = params
 
         self._video_renderers = {}
@@ -1840,16 +1858,28 @@ class DailyInputTransport(BaseInputTransport):
         await super().setup(setup)
 
         await self._client.setup(setup)
+        self._client_acquired = True
 
         # Join the room.
         await self._client.join()
+        self._room_acquired = True
 
     async def cleanup(self):
         """Release input transport resources at teardown."""
-        await super().cleanup()
-        await self._stop_audio_in_task()
-        await self._client.cleanup()
-        await self._transport.cleanup()
+        try:
+            await super().cleanup()
+        finally:
+            try:
+                await self._teardown()
+            finally:
+                try:
+                    if self._client_acquired:
+                        self._client_acquired = False
+                        await self._client.cleanup()
+                    else:
+                        await self._client.cleanup_uninitialized()
+                finally:
+                    await self._transport.cleanup()
 
     async def start(self, frame: StartFrame):
         """Start the input transport and join the Daily room.
@@ -1908,16 +1938,13 @@ class DailyInputTransport(BaseInputTransport):
         self._streaming_started = True
 
     async def _teardown(self):
-        """Leave the room and stop the audio-in task.
-
-        Shared by stop() and cancel(). The room leave is balanced against join()
-        via the client's leave counter, so it stays out of cleanup(); the
-        audio-in task cancel is also reached from cleanup().
-        """
-        # Leave the room.
-        await self._client.leave()
-        # Stop audio thread.
-        await self._stop_audio_in_task()
+        """Release this owner's room acquisition once, before awaiting leave."""
+        try:
+            if self._room_acquired:
+                self._room_acquired = False
+                await self._client.leave()
+        finally:
+            await self._stop_audio_in_task()
 
     async def _stop_audio_in_task(self):
         """Cancel the audio-in task if running. Idempotent."""
@@ -2115,6 +2142,8 @@ class DailyOutputTransport(BaseOutputTransport):
 
         self._transport = transport
         self._client = client
+        self._client_acquired = False
+        self._room_acquired = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the output transport with shared client setup.
@@ -2125,15 +2154,28 @@ class DailyOutputTransport(BaseOutputTransport):
         await super().setup(setup)
 
         await self._client.setup(setup)
+        self._client_acquired = True
 
         # Join the room.
         await self._client.join()
+        self._room_acquired = True
 
     async def cleanup(self):
         """Cleanup output transport and shared resources."""
-        await super().cleanup()
-        await self._client.cleanup()
-        await self._transport.cleanup()
+        try:
+            await super().cleanup()
+        finally:
+            try:
+                await self._teardown()
+            finally:
+                try:
+                    if self._client_acquired:
+                        self._client_acquired = False
+                        await self._client.cleanup()
+                    else:
+                        await self._client.cleanup_uninitialized()
+                finally:
+                    await self._transport.cleanup()
 
     async def start(self, frame: StartFrame):
         """Start the output transport and join the Daily room.
@@ -2168,13 +2210,10 @@ class DailyOutputTransport(BaseOutputTransport):
         await self._teardown()
 
     async def _teardown(self):
-        """Leave the room.
-
-        Shared by stop() and cancel(). The room leave is balanced against join()
-        via the client's leave counter, so it stays out of cleanup(), which
-        releases the shared client through its own teardown.
-        """
-        await self._client.leave()
+        """Release this owner's room acquisition once, before awaiting leave."""
+        if self._room_acquired:
+            self._room_acquired = False
+            await self._client.leave()
 
     async def send_message(
         self, frame: OutputTransportMessageFrame | OutputTransportMessageUrgentFrame

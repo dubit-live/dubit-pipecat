@@ -219,3 +219,46 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPipelineRunnerCancellation(unittest.IsolatedAsyncioTestCase):
+    async def test_runner_cancels_blocked_end_and_peer_pipeline(self):
+        from unittest.mock import patch
+
+        from pipecat.frames.frames import EndFrame
+        from pipecat.pipeline.pipeline import Pipeline
+        from pipecat.pipeline.worker import PipelineWorker
+        from pipecat.processors.frame_processor import FrameProcessor
+
+        entered = asyncio.Event()
+        cleaned = []
+
+        class Processor(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, EndFrame):
+                    entered.set()
+                    await asyncio.Event().wait()
+                await self.push_frame(frame, direction)
+
+            async def cleanup(self):
+                await super().cleanup()
+                cleaned.append(self.name)
+
+        blocked = PipelineWorker(
+            Pipeline([Processor(name="blocked")]), enable_rtvi=False, cancel_timeout_secs=0.03
+        )
+        peer = PipelineWorker(
+            Pipeline([Processor(name="peer")]), enable_rtvi=False, cancel_timeout_secs=0.03
+        )
+        runner = WorkerRunner(handle_sigint=False)
+        await runner.add_workers(blocked, peer)
+        await blocked.queue_frame(EndFrame())
+        with patch("pipecat.pipeline.worker.warm_deferred_imports"):
+            running = asyncio.create_task(runner.run())
+            await asyncio.wait_for(entered.wait(), 1)
+            await runner.cancel(reason="owner disconnected")
+            await asyncio.wait_for(running, 1)
+        self.assertTrue(blocked.has_finished())
+        self.assertTrue(peer.has_finished())
+        self.assertCountEqual(cleaned, ["blocked", "peer"])

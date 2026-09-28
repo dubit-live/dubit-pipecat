@@ -338,7 +338,14 @@ class TestPipelineWorker(unittest.IsolatedAsyncioTestCase):
     async def test_task_stopped_event_handler(self):
         stop_received = False
 
-        identity = IdentityFilter()
+        cleaned = []
+
+        class CleanupRecorder(IdentityFilter):
+            async def cleanup(self):
+                cleaned.append(True)
+                await super().cleanup()
+
+        identity = CleanupRecorder()
         pipeline = Pipeline([identity])
         worker = PipelineWorker(pipeline)
 
@@ -351,6 +358,8 @@ class TestPipelineWorker(unittest.IsolatedAsyncioTestCase):
         await worker.run(WorkerParams(task_manager=TaskManager()))
 
         assert stop_received
+        self.assertEqual(cleaned, [])
+        await pipeline.cleanup()
 
     async def test_task_frame_reached_event_handlers(self):
         upstream_received = False
@@ -1146,3 +1155,186 @@ class TestPipelineWorker(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCancellationLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from unittest.mock import patch
+
+        self.warmup = patch("pipecat.pipeline.worker.warm_deferred_imports")
+        self.warmup.start()
+        self.addCleanup(self.warmup.stop)
+
+    async def _cancel_blocked(self, phase):
+        entered = asyncio.Event()
+        released = asyncio.Event()
+        cleaned = []
+        seen = []
+
+        class Blocker(FrameProcessor):
+            async def setup(self, setup):
+                await super().setup(setup)
+                if phase == "setup":
+                    entered.set()
+                    await released.wait()
+
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                seen.append(frame)
+                if (phase == "start" and isinstance(frame, StartFrame)) or (
+                    phase == "end" and isinstance(frame, EndFrame)
+                ):
+                    entered.set()
+                    await released.wait()
+                await self.push_frame(frame, direction)
+
+            async def cleanup(self):
+                cleaned.append(True)
+                await super().cleanup()
+
+        worker = PipelineWorker(
+            Pipeline([Blocker()]),
+            enable_rtvi=False,
+            cancel_timeout_secs=0.03,
+            setup_timeout_secs=30,
+            start_timeout_secs=30,
+        )
+        terminal = []
+
+        @worker.event_handler("on_pipeline_finished")
+        async def on_finished(_, frame):
+            terminal.append(frame)
+
+        manager = TaskManager()
+        if phase == "before":
+            await worker.cancel(reason="first")
+        if phase == "end":
+            await worker.queue_frame(EndFrame())
+        running = asyncio.create_task(worker.run(WorkerParams(task_manager=manager)))
+        try:
+            if phase != "before":
+                await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(worker.cancel(reason="first"), 0.1)
+            await asyncio.wait_for(worker.cancel(reason="duplicate"), 0.1)
+            done, _ = await asyncio.wait([running], timeout=0.3)
+            self.assertIn(running, done, f"cancel did not interrupt {phase}")
+            await running
+            self.assertTrue(worker.has_finished())
+            self.assertEqual(cleaned, [True])
+            if phase in ("start", "end"):
+                self.assertEqual([frame.reason for frame in terminal], ["first"])
+            if phase == "before":
+                self.assertFalse(any(isinstance(frame, StartFrame) for frame in seen))
+        finally:
+            released.set()
+            running.cancel()
+            await asyncio.wait([running], timeout=0.1)
+            running.cancel()
+            remaining = list(manager.current_tasks())
+            for task in remaining:
+                task.cancel()
+            if remaining:
+                await asyncio.wait(remaining, timeout=0.1)
+            await asyncio.gather(running, return_exceptions=True)
+
+    async def test_cancel_before_run_does_not_start_pipeline(self):
+        await self._cancel_blocked("before")
+
+    async def test_cancel_interrupts_setup(self):
+        await self._cancel_blocked("setup")
+
+    async def test_cancel_interrupts_blocked_start(self):
+        await self._cancel_blocked("start")
+
+    async def test_cancel_interrupts_blocked_end(self):
+        await self._cancel_blocked("end")
+
+    async def test_late_end_does_not_acknowledge_cancellation(self):
+        entered = asyncio.Event()
+        terminal = []
+        timeouts = []
+
+        class LateEnd(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, EndFrame):
+                    entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        await self.push_frame(frame, direction)
+                        raise
+                elif isinstance(frame, CancelFrame):
+                    return
+                await self.push_frame(frame, direction)
+
+        worker = PipelineWorker(Pipeline([LateEnd()]), enable_rtvi=False, cancel_timeout_secs=0.03)
+
+        @worker.event_handler("on_pipeline_timeout")
+        async def on_timeout(_, frame):
+            timeouts.append(frame)
+
+        @worker.event_handler("on_pipeline_finished")
+        async def on_finished(_, frame):
+            terminal.append(frame)
+
+        await worker.queue_frame(EndFrame())
+        running = asyncio.create_task(worker.run(WorkerParams(task_manager=TaskManager())))
+        await asyncio.wait_for(entered.wait(), 1)
+        await worker.cancel(reason="cancel beats late end")
+        await asyncio.wait_for(running, 1)
+        self.assertEqual([type(frame) for frame in timeouts], [CancelFrame])
+        self.assertEqual([type(frame) for frame in terminal], [CancelFrame])
+        self.assertEqual(terminal[0].reason, "cancel beats late end")
+
+    async def test_cancel_timeout_includes_direct_delivery(self):
+        started = asyncio.Event()
+        cleaned = []
+
+        class DirectBlocker(FrameProcessor):
+            def __init__(self):
+                super().__init__(enable_direct_mode=True)
+
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, CancelFrame):
+                    await asyncio.Event().wait()
+                await self.push_frame(frame, direction)
+
+            async def cleanup(self):
+                await super().cleanup()
+                cleaned.append(True)
+
+        worker = PipelineWorker(
+            Pipeline([DirectBlocker()]), enable_rtvi=False, cancel_timeout_secs=0.03
+        )
+
+        @worker.event_handler("on_pipeline_started")
+        async def on_started(*_):
+            started.set()
+
+        running = asyncio.create_task(worker.run(WorkerParams(task_manager=TaskManager())))
+        await asyncio.wait_for(started.wait(), 1)
+        await worker.cancel()
+        done, _ = await asyncio.wait([running], timeout=0.3)
+        try:
+            self.assertIn(running, done)
+            self.assertEqual(cleaned, [True])
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    async def test_end_notification_requesting_cancel_is_only_notified_once(self):
+        terminal = []
+        worker = PipelineWorker(
+            Pipeline([IdentityFilter()]), enable_rtvi=False, cancel_timeout_secs=0.03
+        )
+
+        @worker.event_handler("on_pipeline_finished")
+        async def on_finished(_, frame):
+            terminal.append(frame)
+            await worker.cancel(reason="cancel after end")
+
+        await worker.queue_frame(EndFrame())
+        await asyncio.wait_for(worker.run(WorkerParams(task_manager=TaskManager())), 1)
+        self.assertEqual([type(frame) for frame in terminal], [EndFrame])
